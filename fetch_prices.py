@@ -20,6 +20,8 @@ import sys
 from datetime import date
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ---------- CONFIG ----------
 API_KEY = os.environ.get("AGMARKNET_API_KEY")
@@ -36,6 +38,21 @@ COMMODITIES = ["Onion", "Tomato", "Potato", "Rice", "Wheat"]
 PAGE_LIMIT = 500  # records per API page (API max is usually 1000-2000)
 # ---------- END CONFIG ----------
 
+def _build_session() -> requests.Session:
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=4,
+        backoff_factor=5,  # waits 5s, 10s, 20s, 40s between retries
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    return session
+
+
+_session = _build_session()
+
 
 def fetch_page(offset: int, commodity: str | None = None) -> list[dict]:
     params = {
@@ -48,7 +65,7 @@ def fetch_page(offset: int, commodity: str | None = None) -> list[dict]:
     if commodity:
         params["filters[commodity]"] = commodity
 
-    resp = requests.get(BASE_URL, params=params, timeout=30)
+    resp = _session.get(BASE_URL, params=params, timeout=60)
     resp.raise_for_status()
     payload = resp.json()
     return payload.get("records", [])
