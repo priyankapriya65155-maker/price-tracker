@@ -44,7 +44,7 @@ st.sidebar.header("Filters")
 fuel_type = st.sidebar.radio("Fuel type", sorted(df["fuel_type"].unique()))
 
 cities = sorted(df[df["fuel_type"] == fuel_type]["city"].dropna().unique())
-selected_cities = st.sidebar.multiselect("Cities", cities, default=cities[:5] if cities else [])
+selected_cities = st.sidebar.multiselect("Cities", cities, default=cities)
 
 filtered = df[df["fuel_type"] == fuel_type]
 if selected_cities:
