@@ -11,6 +11,7 @@ Actions workflow in .github/workflows/update_prices.yml), so the
 database keeps growing on its own.
 """
 
+import io
 import os
 import sqlite3
 from datetime import date
@@ -39,7 +40,7 @@ def fetch_city_table(fuel_type: str, url: str) -> pd.DataFrame:
     resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
 
-    tables = pd.read_html(resp.text)
+    tables = pd.read_html(io.StringIO(resp.text))
 
     # Find the table that has City / Price / Price Change columns
     target = None
