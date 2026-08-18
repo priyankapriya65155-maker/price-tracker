@@ -1,143 +1,106 @@
 """
 fetch_prices.py
 ----------------
-Pulls today's commodity (mandi/vegetable) prices from the official
-Agmarknet dataset on data.gov.in, and appends them to a local SQLite
-database. Designed to be run daily (manually, or via GitHub Actions cron)
-so the database grows into a real historical time series.
+Pulls today's petrol and diesel prices for major Indian cities from
+GoodReturns.in — a public webpage, no login, no API key needed.
+Appends the results to a local SQLite database so it builds up a
+day-by-day price history over time.
 
-Setup:
-    1. Get a free API key: data.gov.in -> sign up -> My Account -> API Keys
-    2. Set it as an environment variable AGMARKNET_API_KEY
-       (locally: export AGMARKNET_API_KEY=xxxx
-        in GitHub Actions: add it as a repo secret, see workflow file)
-    3. Edit STATE / COMMODITIES below to whatever you want to track.
+This is designed to be run automatically once a day (via the GitHub
+Actions workflow in .github/workflows/update_prices.yml), so the
+database keeps growing on its own.
 """
 
 import os
 import sqlite3
-import sys
 from datetime import date
 
+import pandas as pd
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-# ---------- CONFIG ----------
-API_KEY = os.environ.get("AGMARKNET_API_KEY")
-RESOURCE_ID = "9ef84268-d588-465a-a308-a864a43d0070"  # Agmarknet daily mandi prices
-BASE_URL = f"https://api.data.gov.in/resource/{RESOURCE_ID}"
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "prices.db")
 
-# Filter to a state and a handful of commodities to keep the dataset focused.
-# Leave COMMODITIES = [] to pull everything for the state (larger, slower).
-STATE = "Telangana"
-COMMODITIES = ["Onion", "Tomato", "Potato", "Rice", "Wheat"]
+PAGES = {
+    "Petrol": "https://www.goodreturns.in/petrol-price.html",
+    "Diesel": "https://www.goodreturns.in/diesel-price.html",
+}
 
-PAGE_LIMIT = 500  # records per API page (API max is usually 1000-2000)
-# ---------- END CONFIG ----------
-
-def _build_session() -> requests.Session:
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=4,
-        backoff_factor=5,  # waits 5s, 10s, 20s, 40s between retries
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
+HEADERS = {
+    # A normal browser user-agent, so the site serves the regular page
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
     )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("https://", adapter)
-    return session
+}
 
 
-_session = _build_session()
-
-
-def fetch_page(offset: int, commodity: str | None = None) -> list[dict]:
-    params = {
-        "api-key": API_KEY,
-        "format": "json",
-        "limit": PAGE_LIMIT,
-        "offset": offset,
-        "filters[state]": STATE,
-    }
-    if commodity:
-        params["filters[commodity]"] = commodity
-
-    resp = _session.get(BASE_URL, params=params, timeout=60)
+def fetch_city_table(fuel_type: str, url: str) -> pd.DataFrame:
+    """Downloads the page and pulls out the 'Metro Cities & State Capitals' table."""
+    resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
-    payload = resp.json()
-    return payload.get("records", [])
+
+    tables = pd.read_html(resp.text)
+
+    # Find the table that has City / Price / Price Change columns
+    target = None
+    for t in tables:
+        cols = [str(c).strip().lower() for c in t.columns]
+        if "city" in cols and "price" in cols:
+            target = t
+            break
+
+    if target is None:
+        raise ValueError(f"Could not find the city price table on {url}")
+
+    target = target.rename(columns={c: str(c).strip() for c in target.columns})
+    target["fuel_type"] = fuel_type
+    return target[["fuel_type", "City", "Price", "Price Change"]]
 
 
-def fetch_all_records() -> list[dict]:
-    all_records = []
-    commodities_to_pull = COMMODITIES if COMMODITIES else [None]
-
-    for commodity in commodities_to_pull:
-        offset = 0
-        while True:
-            records = fetch_page(offset, commodity)
-            if not records:
-                break
-            all_records.extend(records)
-            offset += PAGE_LIMIT
-            if len(records) < PAGE_LIMIT:
-                break  # last page for this commodity
-
-    return all_records
+def clean_price(value) -> float:
+    """Turns '₹111.31' or similar text into a plain float."""
+    if pd.isna(value):
+        return None
+    text = str(value).replace("₹", "").replace(",", "").strip()
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS mandi_prices (
+        CREATE TABLE IF NOT EXISTS fuel_prices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date_collected TEXT NOT NULL,
-            arrival_date TEXT,
-            state TEXT,
-            district TEXT,
-            market TEXT,
-            commodity TEXT,
-            variety TEXT,
-            min_price REAL,
-            max_price REAL,
-            modal_price REAL
+            fuel_type TEXT NOT NULL,
+            city TEXT NOT NULL,
+            price REAL,
+            price_change REAL
         )
         """
     )
     conn.commit()
 
 
-def insert_records(conn: sqlite3.Connection, records: list[dict]) -> int:
+def insert_rows(conn: sqlite3.Connection, df: pd.DataFrame) -> int:
     today = date.today().isoformat()
-    rows = []
-    for r in records:
-        try:
-            rows.append(
-                (
-                    today,
-                    r.get("arrival_date"),
-                    r.get("state"),
-                    r.get("district"),
-                    r.get("market"),
-                    r.get("commodity"),
-                    r.get("variety"),
-                    float(r.get("min_price") or 0),
-                    float(r.get("max_price") or 0),
-                    float(r.get("modal_price") or 0),
-                )
-            )
-        except (TypeError, ValueError):
-            continue  # skip malformed rows rather than crash the whole run
+    rows = [
+        (
+            today,
+            row["fuel_type"],
+            row["City"],
+            clean_price(row["Price"]),
+            clean_price(row["Price Change"]),
+        )
+        for _, row in df.iterrows()
+    ]
 
     conn.executemany(
         """
-        INSERT INTO mandi_prices
-        (date_collected, arrival_date, state, district, market,
-         commodity, variety, min_price, max_price, modal_price)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO fuel_prices (date_collected, fuel_type, city, price, price_change)
+        VALUES (?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -146,21 +109,19 @@ def insert_records(conn: sqlite3.Connection, records: list[dict]) -> int:
 
 
 def main():
-    if not API_KEY:
-        print("ERROR: AGMARKNET_API_KEY environment variable not set.", file=sys.stderr)
-        sys.exit(1)
-
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
-    print(f"Fetching prices for state={STATE}, commodities={COMMODITIES or 'ALL'}...")
-    records = fetch_all_records()
-    print(f"Fetched {len(records)} raw records from Agmarknet.")
+    total_inserted = 0
+    for fuel_type, url in PAGES.items():
+        print(f"Fetching {fuel_type} prices from {url} ...")
+        df = fetch_city_table(fuel_type, url)
+        inserted = insert_rows(conn, df)
+        total_inserted += inserted
+        print(f"  -> inserted {inserted} {fuel_type} rows")
 
-    inserted = insert_records(conn, records)
-    print(f"Inserted {inserted} rows into {DB_PATH}.")
-
+    print(f"Done. Total rows inserted today: {total_inserted}")
     conn.close()
 
 
